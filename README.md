@@ -252,7 +252,7 @@ npm run lint    # 代码检查
 npm run check:push # 校验个人云部署包
 ```
 
-## License
+## License 
 
 本项目采用 GNU Affero General Public License v3.0 only（AGPL-3.0-only）开源。详见 [LICENSE](./LICENSE)。
 
