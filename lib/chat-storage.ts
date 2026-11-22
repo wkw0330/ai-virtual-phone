@@ -19,6 +19,17 @@ export const MAX_VISION_IMAGE_PROMPT_LIMIT = 20;
 export const CHAT_INITIAL_VISIBLE_MESSAGE_COUNT = 50;
 export const CHAT_LOAD_MORE_MESSAGE_COUNT = 30;
 
+/**
+ * 单个会话最多保留的消息条数。
+ *
+ * iOS 闪退根因之一：聊天记录只增不减、每条长消息还冗余存 3 份全文
+ * （content / rawResponseText / editableResponseText），Data 无限膨胀，
+ * IndexedDB + 内存双重吃紧，iOS Safari 在存储/内存压力下会杀掉页面并
+ * 部分丢弃数据。这里给每个会话设一个条数上限，超出时自动裁掉最旧的消息，
+ * 把体积控在安全范围内（聊天窗口仍只显示最近的记录，日常聊天基本无感）。
+ */
+export const MAX_MESSAGES_PER_SESSION = 1000;
+
 export function normalizeVisionImagePromptLimit(value: unknown): number {
     if (value === undefined || value === null || value === "") return DEFAULT_VISION_IMAGE_PROMPT_LIMIT;
     const parsed = typeof value === "number" ? value : Number(value);
@@ -972,6 +983,8 @@ export function hydrateChatStorage(): Promise<void> {
         _sessionsCache = refreshedSessions.items;
         if (normalizedContacts.changed) dbReplaceContacts(normalizedContacts.items);
         if (normalizedSessions.changed || redirectedMessages > 0 || refreshedSessions.changed) dbReplaceSessions(refreshedSessions.items);
+        // 启动后整体治理：把已经膨胀的超限会话裁回上限内，避免 iOS 闪退继续发生
+        pruneAllSessionsToLimit();
         _hydrated = true;
     }).catch(err => {
         console.warn("[ChatStorage] hydration failed, will retry on next call:", err);
@@ -986,6 +999,37 @@ export function isChatStorageHydrated(): boolean {
 
 function _loadAllMessages(): ChatMessage[] {
     return _messagesCache;
+}
+
+/**
+ * 把单个会话的消息裁剪到上限以内（只删最旧的，保留最近的记录）。
+ *
+ * iOS 闪退根因之一：数据只增不减 + 每条长消息冗余存 3 份全文，IndexedDB 体积
+ * 无限膨胀，iOS 在存储/内存压力下会杀掉页面并丢失未落盘数据。这个裁剪在
+ * 「每条新消息后」和「启动加载后」都跑一遍，把体积控在安全范围。
+ * 依赖函数提升：pushChatMessage 中引用本函数（定义在其后）是合法的。
+ */
+function pruneSessionMessagesToLimit(sessionId: string): void {
+    if (!MAX_MESSAGES_PER_SESSION || MAX_MESSAGES_PER_SESSION <= 0) return;
+    const all = getSortedSessionMessages(sessionId);
+    if (all.length <= MAX_MESSAGES_PER_SESSION) return;
+    const excessCount = all.length - MAX_MESSAGES_PER_SESSION;
+    const idsToDelete = all.slice(0, excessCount).map(m => m.id);
+    // deleteChatMessagesByIds 是完整的删除链路：同步内存缓存、IndexedDB、会话预览、重组元数据
+    deleteChatMessagesByIds(sessionId, idsToDelete);
+}
+
+/** 启动加载后整体治理一遍所有会话，把已膨胀的旧数据裁到上限内。 */
+function pruneAllSessionsToLimit(): void {
+    if (!MAX_MESSAGES_PER_SESSION || MAX_MESSAGES_PER_SESSION <= 0) return;
+    const sessionIds = Array.from(new Set(_messagesCache.map(m => m.sessionId)));
+    for (const sessionId of sessionIds) {
+        try {
+            pruneSessionMessagesToLimit(sessionId);
+        } catch (err) {
+            console.warn("[ChatStorage] prune session failed:", sessionId, err);
+        }
+    }
 }
 
 // ── CRUD for Contacts ─────────────────────────
@@ -1169,6 +1213,9 @@ export function pushChatMessage(msg: Omit<ChatMessage, "id" | "createdAt" | "sta
     _messagesCache.push(newMsg);
     dbPutMessage(newMsg);
 
+    // 每条消息落库后裁剪该会话：超过上限自动删最旧，控制 IndexedDB 体积（iOS 闪退根治点之一）
+    pruneSessionMessagesToLimit(msg.sessionId);
+
     // Auto update session last message only for records that can produce a list preview.
     // 优化：直接增量更新内存会话缓存并异步写单条，避免每次发送都走 loadChatSessions +
     // saveChatSessions 触发全量会话预览重算（会话/消息多了以后会明显卡顿）。
@@ -1213,6 +1260,9 @@ export function upsertImportedChatMessage(msg: ChatMessage): { message: ChatMess
 
     _messagesCache.push(newMsg);
     dbPutMessage(newMsg);
+
+    // 导入大备份也可能超限，同样裁剪到上限内
+    pruneSessionMessagesToLimit(newMsg.sessionId);
 
     const preview = getChatMessagePreview(newMsg);
     const sessions = loadChatSessions();
